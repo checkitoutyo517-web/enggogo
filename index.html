@@ -1,0 +1,1780 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>維修管理系統</title>
+    <!-- 載入 Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* 使用 Inter 字體 */
+        body {
+            font-family: "Inter", "Noto Sans TC", sans-serif;
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+        }
+        
+        .tab-button {
+            @apply px-5 py-3 text-sm sm:text-base font-semibold border-b-4 border-transparent transition duration-300;
+        }
+        .tab-button.active {
+            @apply text-blue-600 border-blue-600; /* 選中時的樣式 */
+        }
+        .tab-button:not(.active):hover {
+            @apply bg-gray-100 border-gray-400; /* 未選中時 hover 效果 */
+        }
+        
+        /* --- 修正：Modal 樣式，移除 flex 居中，只保留背景層和固定定位 --- */
+        .modal {
+            @apply fixed inset-0 bg-gray-600 bg-opacity-75 p-4 transition-opacity duration-300 z-50;
+        }
+        .modal-content {
+            /* 讓內容層在 JS 中使用 fixed 定位 */
+            @apply bg-white rounded-lg shadow-xl w-full max-w-2xl max-h-[90vh] overflow-y-auto p-6;
+        }
+        /* 拖曳時的樣式 */
+        .staff-card {
+            cursor: grab;
+        }
+        .staff-card:active {
+            cursor: grabbing;
+        }
+        .drop-highlight {
+            @apply border-4 border-dashed border-blue-400 bg-blue-50;
+        }
+    </style>
+    
+    <!-- *** 新增：載入 FullCalendar *** -->
+    <script src='https://cdn.jsdelivr.net/npm/fullcalendar@6.1.15/index.global.min.js'></script>
+    
+    <!-- 載入 Firebase (開始) -->
+    <script type="module">
+        // Firebase SDK
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { 
+            getFirestore, 
+            doc, getDoc, addDoc, setDoc, updateDoc, deleteDoc, 
+            onSnapshot, collection, query, where, 
+            serverTimestamp, Timestamp,
+            setLogLevel, getDocs
+        } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // 從環境變數讀取 Firebase 設定
+        const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        let app, db, auth;
+
+        try {
+            app = initializeApp(firebaseConfig);
+            db = getFirestore(app);
+            auth = getAuth(app);
+            setLogLevel('Debug');
+        } catch (e) {
+            console.error("Firebase 初始化失敗:", e);
+        }
+
+        let isAuthReady = false;
+        let userId = null;
+        const collectionPath = `/artifacts/${appId}/public/data/repair_requests`;
+        const announcementsCollectionPath = `/artifacts/${appId}/public/data/maintenance_announcements`;
+        const staffCollectionPath = `/artifacts/${appId}/public/data/maintenance_staff`;
+        const likesCollectionPath = `/artifacts/${appId}/public/data/staff_likes`;
+        
+        // --- 全域資料快取 ---
+        let allRequests = [];
+        let allAnnouncements = [];
+        let allStaff = [];
+        let allLikes = [];
+        
+        let calendar = null;
+        let calendarEl = null;
+
+        let currentEditStaffId = null;
+
+        // --- 3. 輔助函數 ---
+        function getCategoryText(category) {
+            switch (category) {
+                case 'water': return '水電';
+                case 'electric': return '電器';
+                case 'network': return '網路';
+                case 'woodwork': return '木工';
+                case 'discussion': return '檢修討論';
+                case 'other': return '其他';
+                default: return '未知';
+            }
+        }
+        
+        function getPriorityText(priority) {
+            switch (priority) {
+                case 'low': return '低';
+                case 'medium': return '中';
+                case 'high': return '高';
+                default: return '未知';
+            }
+        }
+
+        // --- 4. Firestore 監聽器 ---
+        
+        function listenForRepairs() {
+            if (!db || !isAuthReady) return;
+            
+            const q = query(collection(db, collectionPath));
+            onSnapshot(q, (snapshot) => {
+                let requests = [];
+                snapshot.forEach((doc) => {
+                    const data = doc.data();
+                    if (data.createdAt && typeof data.createdAt.toDate === 'function') {
+                        requests.push({ id: doc.id, ...data });
+                    } else {
+                        console.warn("偵測到無效日期資料: ", doc.id, data);
+                        requests.push({ id: doc.id, ...data, createdAt: Timestamp.now() }); 
+                    }
+                });
+
+                requests.sort((a, b) => {
+                    const dateA = a.createdAt ? a.createdAt.toDate() : new Date(0);
+                    const dateB = b.createdAt ? b.createdAt.toDate() : new Date(0);
+                    return dateB - dateA;
+                });
+                
+                allRequests = requests;
+                
+                updateRepairTables();
+                updateCalendarEvents();
+                updateAnalysis();
+
+            }, (error) => {
+                console.error("監聽維修單失敗: ", error);
+                const tableBodyActive = document.getElementById('repairTableBodyActive');
+                const tableBodyArchived = document.getElementById('repairTableBodyArchived');
+                if(tableBodyActive) tableBodyActive.innerHTML = '<tr><td colspan="8" class="text-center py-10 text-red-600">讀取資料時發生錯誤。</td></tr>';
+                if(tableBodyArchived) tableBodyArchived.innerHTML = '<tr><td colspan="8" class="text-center py-10 text-red-600">讀取資料時發生錯誤。</td></tr>';
+            });
+        }
+
+        function listenForAnnouncements() {
+            if (!db || !isAuthReady) return;
+            
+            const q = query(collection(db, announcementsCollectionPath));
+            onSnapshot(q, (snapshot) => {
+                let announcements = [];
+                snapshot.forEach((doc) => {
+                    announcements.push({ id: doc.id, ...doc.data() });
+                });
+                
+                announcements.sort((a, b) => {
+                    const dateA = a.startDate ? a.startDate.toDate() : new Date(0);
+                    const dateB = b.startDate ? b.startDate.toDate() : new Date(0);
+                    return dateA - dateB;
+                });
+                
+                allAnnouncements = announcements;
+                updateCalendarEvents();
+
+            }, (error) => {
+                console.error("監聽公告失敗: ", error);
+            });
+        }
+
+        function listenForLikes() {
+            if (!db || !isAuthReady) return;
+            
+            const q = query(collection(db, likesCollectionPath));
+            onSnapshot(q, (snapshot) => {
+                let likes = [];
+                snapshot.forEach((doc) => {
+                    likes.push({ id: doc.id, ...doc.data() });
+                });
+                allLikes = likes;
+                updateAnalysis();
+                // 由於 displayStaff 依賴 allLikes，这里需要手動觸發一次 displayStaff 來更新讚數，以防 staff 列表不更新。
+                displayStaff(); 
+            }, (error) => {
+                console.error("監聽按讚失敗: ", error);
+            });
+        }
+        
+        async function seedAndListenForStaff() {
+            if (!db || !isAuthReady) return;
+
+            const q = query(collection(db, staffCollectionPath));
+            
+            try {
+                const snapshot = await getDocs(q);
+                if (snapshot.empty) {
+                    console.log("人員資料庫為空，正在填充範例資料...");
+                    const sampleStaff = [
+                        { name: '王大明', engName: 'David', phone: '0911-111-111', shift: '07:00-15:00', photoUrl: 'https://placehold.co/100x100/E2E8F0/333?text=Wang' },
+                        { name: '陳小美', engName: 'Mary', phone: '0922-222-222', shift: '07:00-15:00', photoUrl: 'https://placehold.co/100x100/E2E8F0/333?text=Chen' },
+                        { name: '林阿姨', engName: 'Auntie Lin', phone: '0933-333-333', shift: '15:00-24:00', photoUrl: 'https://placehold.co/100x100/E2E8F0/333?text=Lin' },
+                        { name: '李大哥', engName: 'Brother Lee', phone: '0944-444-444', shift: '00:00-08:00', photoUrl: 'https://placehold.co/100x100/E2E8F0/333?text=Lee' },
+                        { name: '吳經理', engName: 'Manager Wu', phone: '0955-555-555', shift: 'holiday', photoUrl: 'https://placehold.co/100x100/E2E8F0/333?text=Wu' }
+                    ];
+                    for (const staff of sampleStaff) {
+                        await addDoc(collection(db, staffCollectionPath), staff);
+                    }
+                }
+            } catch (error) {
+                console.error("填充人員資料失敗: ", error);
+            }
+            
+            onSnapshot(q, (snapshot) => {
+                let staffList = [];
+                snapshot.forEach((doc) => {
+                    staffList.push({ id: doc.id, ...doc.data() });
+                });
+                allStaff = staffList;
+                displayStaff();
+                updateStaffModalList(staffList);
+            }, (error) => {
+                console.error("監聽人員失敗: ", error);
+            });
+        }
+
+        // --- 5. UI 更新函數 ---
+
+        // *** 修復：顯示人員卡片 (加入拖曳屬性和讚數) ***
+        function displayStaff() {
+            const shiftContainers = {
+                '07:00-15:00': document.getElementById('staffShift1'),
+                '15:00-24:00': document.getElementById('staffShift2'),
+                '00:00-08:00': document.getElementById('staffShift3'),
+                'holiday': document.getElementById('staffShiftHoliday')
+            };
+            
+            if (Object.values(shiftContainers).some(c => !c)) return;
+
+            Object.values(shiftContainers).forEach(c => c.innerHTML = '');
+            
+            if (allStaff.length === 0) {
+                shiftContainers['07:00-15:00'].innerHTML = '<p class="text-gray-500">正在載入人員資料...</p>';
+                return;
+            }
+
+            let shiftCounts = { '07:00-15:00': 0, '15:00-24:00': 0, '00:00-08:00': 0, 'holiday': 0 };
+
+            allStaff.forEach(staff => {
+                const totalLikes = allLikes.filter(like => like.staffId === staff.id).length;
+
+                const card = document.createElement('div');
+                card.className = 'staff-card bg-white border border-gray-200 rounded-lg shadow-md p-4 flex items-center space-x-4 transition duration-300 transform hover:shadow-xl hover:scale-[1.01]';
+                
+                // *** D&D 屬性 ***
+                card.setAttribute('draggable', true);
+                card.setAttribute('data-staff-id', staff.id);
+                // 拖曳事件將在 DOMContentLoaded 中委派給 panelStaff
+                
+                card.innerHTML = `
+                    <img src="${staff.photoUrl || 'https://placehold.co/100x100/E2E8F0/333?text=?'}" alt="${staff.name}" class="w-20 h-20 rounded-full object-cover border-2 border-gray-300">
+                    <div class="flex-1">
+                        <h3 class="text-xl font-semibold text-gray-900">${staff.name}</h3>
+                        <p class="text-gray-600">${staff.engName || ''}</p>
+                        <p class="text-sm text-gray-500">${staff.phone}</p>
+                    </div>
+                    <button data-staff-id="${staff.id}" data-staff-name="${staff.name}" class="like-btn px-3 py-2 bg-blue-500 text-white text-sm rounded-lg hover:bg-blue-600 transition duration-300 flex items-center space-x-1">
+                        <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
+                            <path d="M2 10.5a1.5 1.5 0 113 0v6a1.5 1.5 0 01-3 0v-6zM6 10.333v5.167a1.5 1.5 0 001.5 1.5h5.69a1.5 1.5 0 001.44-1.066l2.35-6.817A1.5 1.5 0 0015.5 6.5h-1.085a1.5 1.5 0 00-1.447 1.066L12 11.833V4.5a1.5 1.5 0 00-1.5-1.5h-1a1.5 1.5 0 00-1.5 1.5v6.833z" />
+                        </svg>
+                        <span>${totalLikes} 讚</span>
+                    </button>
+                `;
+                
+                const container = shiftContainers[staff.shift];
+                if (container) {
+                    container.appendChild(card);
+                    shiftCounts[staff.shift]++;
+                }
+            });
+
+            if (shiftCounts['07:00-15:00'] === 0) shiftContainers['07:00-15:00'].innerHTML = '<p class="text-gray-500 col-span-full p-4">目前無人值班</p>';
+            if (shiftCounts['15:00-24:00'] === 0) shiftContainers['15:00-24:00'].innerHTML = '<p class="text-gray-500 col-span-full p-4">目前無人值班</p>';
+            if (shiftCounts['00:00-08:00'] === 0) shiftContainers['00:00-08:00'].innerHTML = '<p class="text-gray-500 col-span-full p-4">目前無人值班</p>';
+            if (shiftCounts['holiday'] === 0) shiftContainers['holiday'].innerHTML = '<p class="text-gray-500 col-span-full p-4">目前無休假人員</p>';
+        }
+
+        function updateStaffModalList(staffList) {
+            const container = document.getElementById('staffListContainer');
+            if (!container) return;
+            
+            container.innerHTML = '';
+            if (staffList.length === 0) {
+                container.innerHTML = '<p class="text-gray-500">尚無人員資料。</p>';
+                return;
+            }
+            
+            staffList.sort((a, b) => a.name.localeCompare(b.name));
+
+            staffList.forEach(staff => {
+                const item = document.createElement('li');
+                item.className = 'flex items-center justify-between p-3 bg-gray-50 rounded-lg';
+                item.innerHTML = `
+                    <div class="flex items-center space-x-3">
+                        <img src="${staff.photoUrl || 'https://placehold.co/40x40/E2E8F0/333?text=?'}" alt="${staff.name}" class="w-10 h-10 rounded-full object-cover">
+                        <div>
+                            <p class="font-semibold">${staff.name} ${staff.engName || ''}</p>
+                            <p class="text-sm text-gray-500">${staff.shift}</p>
+                        </div>
+                    </div>
+                    <div class="space-x-2">
+                        <button data-id="${staff.id}" class="edit-btn px-3 py-1 text-sm bg-yellow-500 text-white rounded-md hover:bg-yellow-600">
+                            編輯
+                        </button>
+                        <button data-id="${staff.id}" class="delete-btn px-3 py-1 text-sm bg-red-500 text-white rounded-md hover:bg-red-600">
+                            刪除
+                        </button>
+                    </div>
+                `;
+                container.appendChild(item);
+            });
+        }
+        
+        // *** 舊的 handleLikeClick 被新功能取代，現在只彈出 Modal ***
+        async function handleLikeClick(button) {
+            if (!db || !isAuthReady || !userId) {
+                alert("系統尚未準備好，請稍候。");
+                return;
+            }
+
+            // Store staff info in hidden fields of the like form
+            document.getElementById('likeStaffId').value = button.dataset.staffId;
+            document.getElementById('likeStaffName').value = button.dataset.staffName;
+
+            // --- 核心修改：計算 Modal 位置 ---
+            const likeModal = document.getElementById('likeModal');
+            const likeModalContent = document.getElementById('likeModalContent');
+
+            const rect = button.getBoundingClientRect();
+            
+            const contentWidth = 380; // Approximate max-w-sm width
+            const contentHeight = 350; // Approximate height
+            const viewportWidth = window.innerWidth;
+            const viewportHeight = window.innerHeight;
+
+            // 1. 初始位置：定位在按鈕右側，垂直對齊
+            let finalLeft = rect.left + rect.width + 10;
+            let finalTop = rect.top;
+
+            // 2. 水平邊界檢查 (如果超出右邊，則定位在按鈕左側)
+            if (finalLeft + contentWidth > viewportWidth) {
+                finalLeft = rect.left - contentWidth - 10;
+                // 如果左側也放不下，則靠右邊緣顯示
+                if (finalLeft < 0) {
+                     finalLeft = viewportWidth - contentWidth - 20; 
+                }
+            }
+            
+            // 3. 垂直邊界檢查 (如果超出底部，則向上推)
+            if (finalTop + contentHeight > viewportHeight) {
+                finalTop = viewportHeight - contentHeight - 20; 
+            }
+
+            // 4. 垂直邊界檢查 (確保不會超出頂部)
+            if (finalTop < 20) {
+                finalTop = 20;
+            }
+            
+            // 5. 應用 fixed position
+            likeModalContent.style.position = 'fixed';
+            likeModalContent.style.top = `${finalTop}px`;
+            likeModalContent.style.left = `${finalLeft}px`;
+            likeModalContent.style.transform = 'none';
+
+            // Show modal
+            likeModal.classList.remove('hidden');
+            document.getElementById('likeStatusMessage').textContent = '';
+        }
+
+        async function handleLikeSubmit(e) {
+            e.preventDefault();
+            const staffId = document.getElementById('likeStaffId').value;
+            const staffName = document.getElementById('likeStaffName').value;
+            const userEmail = document.getElementById('likeUserEmail').value;
+            const reason = document.getElementById('likeReason').value;
+            const statusMsg = document.getElementById('likeStatusMessage');
+            const submitBtn = document.getElementById('likeSubmitButton');
+
+            if (!userEmail || !reason) {
+                statusMsg.textContent = '請填寫您的 Email 和給讚原因。';
+                return;
+            }
+            if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(userEmail)) {
+                statusMsg.textContent = '請輸入有效的 Email 格式。';
+                return;
+            }
+
+            submitBtn.disabled = true;
+            submitBtn.textContent = '處理中...';
+            statusMsg.textContent = '';
+            
+            try {
+                await addDoc(collection(db, likesCollectionPath), {
+                    staffId: staffId,
+                    staffName: staffName,
+                    userEmail: userEmail, // New: Email
+                    reason: reason,       // New: Reason
+                    userId: userId,
+                    createdAt: serverTimestamp()
+                });
+
+                // Success feedback on the original button
+                const originalButton = document.querySelector(`.like-btn[data-staff-id="${staffId}"]`);
+                if (originalButton) {
+                    originalButton.disabled = true;
+                    originalButton.classList.add('liked');
+                    originalButton.innerHTML = `<span>感謝!</span>`;
+                    // onSnapshot will handle the full update and count change
+                }
+
+                document.getElementById('likeModal').classList.add('hidden');
+                document.getElementById('likeForm').reset();
+                
+                // Use custom message for success
+                alert(`已成功為 ${staffName} 給讚！`); 
+
+            } catch (error) {
+                console.error("按讚失敗: ", error);
+                statusMsg.textContent = '按讚失敗，請稍後再試。';
+            } finally {
+                submitBtn.disabled = false;
+                submitBtn.textContent = '確認給讚';
+            }
+        }
+        // *** 結束：按讚提交邏輯 ***
+
+        function updateRepairTables() {
+            const tableBodyActive = document.getElementById('repairTableBodyActive');
+            const tableBodyArchived = document.getElementById('repairTableBodyArchived');
+            if (!tableBodyActive || !tableBodyArchived) return;
+            
+            tableBodyActive.innerHTML = ''; 
+            tableBodyArchived.innerHTML = '';
+            
+            let activeCount = 0;
+            let archivedCount = 0;
+
+            allRequests.forEach(req => {
+                const tr = document.createElement('tr');
+                tr.className = 'border-b hover:bg-gray-50';
+                
+                const statusOptions = `
+                    <option value="已提交" ${req.status === '已提交' ? 'selected' : ''}>已提交</option>
+                    <option value="處理中" ${req.status === '處理中' ? 'selected' : ''}>處理中</option>
+                    <option value="已結案" ${req.status === '已結案' ? 'selected' : ''}>已結案</option>
+                    <option value="已取消" ${req.status === '已取消' ? 'selected' : ''}>已取消</option>
+                `;
+
+                tr.innerHTML = `
+                    <td class="px-4 py-3 text-sm text-gray-700">${req.caseId || 'N/A'}</td>
+                    <td class="px-4 py-3 text-sm text-gray-700">${req.createdAt ? req.createdAt.toDate().toLocaleDateString() : 'N/A'}</td>
+                    <td class="px-4 py-3 text-sm text-gray-700">${req.requesterName || 'N/A'}</td>
+                    <td class="px-4 py-3 text-sm text-gray-700">${req.location || 'N/A'}</td>
+                    <td class="px-4 py-3 text-sm text-gray-700">${getCategoryText(req.category)}</td>
+                    <td class="px-4 py-3 text-sm">
+                        <select data-id="${req.id}" data-field="status" class="status-select rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 ${req.status === '已結案' ? 'bg-green-100' : 'bg-white'}">
+                            ${statusOptions}
+                        </select>
+                    </td>
+                    <td class="px-4 py-3 text-sm">
+                        <input type="text" data-id="${req.id}" data-field="remarks" value="${req.remarks || ''}" class="remarks-input rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 w-full">
+                    </td>
+                    <td class="px-4 py-3 text-center">
+                        <button data-id="${req.id}" class="save-btn px-3 py-1 bg-blue-500 text-white text-xs rounded-md hover:bg-blue-600 transition duration-300">
+                            儲存
+                        </button>
+                    </td>
+                `;
+                
+                if (req.status === '已結案' || req.status === '已取消') {
+                    tr.querySelector('.status-select').disabled = true;
+                    tr.querySelector('.remarks-input').disabled = true;
+                    tr.querySelector('.save-btn').style.display = 'none';
+                    tableBodyArchived.appendChild(tr);
+                    archivedCount++;
+                } else {
+                    tableBodyActive.appendChild(tr);
+                    activeCount++;
+                }
+            });
+
+            if (activeCount === 0) {
+                tableBodyActive.innerHTML = '<tr><td colspan="8" class="text-center py-10 text-gray-500">目前沒有待處理的案件。</td></tr>';
+            }
+            if (archivedCount === 0) {
+                tableBodyArchived.innerHTML = '<tr><td colspan="8" class="text-center py-10 text-gray-500">目前沒有已結案的案件。</td></tr>';
+            }
+        }
+
+        function updateCalendarEvents() {
+            if (!calendar) return;
+
+            const repairEvents = allRequests.map(req => {
+                const title = `[${req.location || 'N/A'}] - ${getCategoryText(req.category)}`;
+                let color = '#3b82f6';
+                if (req.status === '處理中') color = '#f59e0b';
+                if (req.status === '已結案') color = '#6b7280';
+                if (req.status === '已取消') color = '#ef4444';
+                return {
+                    title: title,
+                    start: req.createdAt ? req.createdAt.toDate().toISOString().split('T')[0] : new Date().toISOString().split('T')[0],
+                    allDay: true,
+                    color: color,
+                    extendedProps: { caseId: req.caseId }
+                };
+            });
+
+            const announcementEvents = allAnnouncements.map(ann => {
+                const title = `[公告] ${ann.title}`;
+                let endDate = null;
+                if (ann.endDate) {
+                    const tempDate = ann.endDate.toDate();
+                    tempDate.setDate(tempDate.getDate() + 1);
+                    endDate = tempDate.toISOString().split('T')[0];
+                }
+                return {
+                    title: title,
+                    start: ann.startDate ? ann.startDate.toDate().toISOString().split('T')[0] : new Date().toISOString().split('T')[0],
+                    end: endDate,
+                    allDay: true,
+                    color: '#10b981',
+                    extendedProps: { description: ann.description }
+                };
+            });
+            
+            const allEvents = repairEvents.concat(announcementEvents);
+            calendar.removeAllEvents();
+            calendar.addEventSource(allEvents);
+        }
+
+        function updateAnalysis() {
+            const statsTotalClosed = document.getElementById('statsTotalClosed');
+            const statsPriorityHigh = document.getElementById('statsPriorityHigh');
+            const statsCategoryList = document.getElementById('statsCategoryList');
+            const statsLikesToday = document.getElementById('statsLikesToday');
+            const statsLikesMonth = document.getElementById('statsLikesMonth');
+            
+            if (!statsTotalClosed || !statsPriorityHigh || !statsCategoryList || !statsLikesToday || !statsLikesMonth) {
+                return;
+            }
+
+            const archivedRequests = allRequests.filter(r => r.status === '已結案');
+            const totalClosed = archivedRequests.length;
+            statsTotalClosed.textContent = totalClosed;
+
+            if (totalClosed === 0) {
+                statsPriorityHigh.textContent = '0';
+                statsCategoryList.innerHTML = '<li class="text-gray-500">尚無結案資料</li>';
+            } else {
+                const categoryCounts = { water: 0, electric: 0, network: 0, woodwork: 0, discussion: 0, other: 0 };
+                const priorityCounts = { low: 0, medium: 0, high: 0 };
+
+                archivedRequests.forEach(req => {
+                    if (req.category in categoryCounts) categoryCounts[req.category]++;
+                    if (req.priority in priorityCounts) priorityCounts[req.priority]++;
+                });
+
+                statsPriorityHigh.textContent = priorityCounts.high;
+
+                statsCategoryList.innerHTML = '';
+                const categories = [
+                    { id: 'water', name: '水電' }, { id: 'electric', name: '電器' },
+                    { id: 'network', name: '網路' }, { id: 'woodwork', name: '木工' },
+                    { id: 'discussion', name: '檢修討論' }, { id: 'other', name: '其他' },
+                ];
+                categories.sort((a, b) => categoryCounts[b.id] - categoryCounts[a.id]);
+
+                categories.forEach(cat => {
+                    const count = categoryCounts[cat.id];
+                    const percentage = totalClosed > 0 ? ((count / totalClosed) * 100).toFixed(1) : 0;
+                    const li = document.createElement('li');
+                    li.className = 'mb-3';
+                    li.innerHTML = `
+                        <div class="flex justify-between items-center mb-1">
+                            <span class="text-gray-700">${cat.name}</span>
+                            <span class="text-gray-900 font-semibold">${count} 件 (${percentage}%)</span>
+                        </div>
+                        <div class="w-full bg-gray-200 rounded-full h-2.5">
+                            <div class="bg-blue-600 h-2.5 rounded-full" style="width: ${percentage}%"></div>
+                        </div>
+                    `;
+                    statsCategoryList.appendChild(li);
+                });
+            }
+            
+            const now = new Date();
+            const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+            const todayEnd = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
+            const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+            const monthEnd = new Date(now.getFullYear(), now.getMonth() + 1, 1);
+            
+            let todayLikesCount = 0;
+            let monthLikesCount = 0;
+            
+            allLikes.forEach(like => {
+                if (!like.createdAt) return;
+                const likeDate = like.createdAt.toDate();
+                
+                if (likeDate >= monthStart && likeDate < monthEnd) {
+                    monthLikesCount++;
+                }
+                if (likeDate >= todayStart && likeDate < todayEnd) {
+                    todayLikesCount++;
+                }
+            });
+
+            statsLikesToday.textContent = todayLikesCount;
+            statsLikesMonth.textContent = monthLikesCount;
+        }
+
+
+        // --- D&D Logic (已修復並新增) ---
+        let draggedStaffId = null;
+
+        function handleDragStart(e) {
+            const card = e.target.closest('.staff-card');
+            if (card) {
+                draggedStaffId = card.dataset.staffId;
+                e.dataTransfer.setData('text/plain', draggedStaffId);
+                e.dataTransfer.effectAllowed = 'move';
+                // 使用延遲來避免拖曳時抓到透明度設置
+                setTimeout(() => card.classList.add('opacity-50'), 0); 
+            }
+        }
+
+        function handleDragOver(e) {
+            e.preventDefault(); 
+            const dropZone = e.target.closest('.shift-drop-zone');
+            if (dropZone) {
+                e.dataTransfer.dropEffect = 'move';
+                dropZone.classList.add('drop-highlight');
+            } else {
+                e.dataTransfer.dropEffect = 'none';
+            }
+        }
+        
+        function handleDragLeave(e) {
+            const dropZone = e.target.closest('.shift-drop-zone');
+            if (dropZone) {
+                dropZone.classList.remove('drop-highlight');
+            }
+        }
+
+        async function handleDrop(e) {
+            e.preventDefault();
+            const dropZone = e.target.closest('.shift-drop-zone');
+            if (!dropZone) return;
+
+            // 清除拖曳時的高亮效果
+            dropZone.classList.remove('drop-highlight');
+
+            const staffId = e.dataTransfer.getData('text/plain');
+            
+            // 移除拖曳時的透明度
+            const staffCard = document.querySelector(`.staff-card[data-staff-id="${staffId}"]`);
+            if (staffCard) staffCard.classList.remove('opacity-50');
+
+            if (!staffId) return;
+
+            const newShiftId = dropZone.id;
+            let newShift = '';
+
+            switch(newShiftId) {
+                case 'staffShift1': newShift = '07:00-15:00'; break;
+                case 'staffShift2': newShift = '15:00-24:00'; break;
+                case 'staffShift3': newShift = '00:00-08:00'; break;
+                case 'staffShiftHoliday': newShift = 'holiday'; break;
+                default: return;
+            }
+
+            if (staffId && newShift) {
+                await updateStaffShift(staffId, newShift);
+            }
+        }
+
+        async function updateStaffShift(staffId, newShift) {
+            if (!db || !isAuthReady) {
+                alert("更新班別失敗，請檢查登入狀態。");
+                return;
+            }
+            try {
+                const docRef = doc(db, staffCollectionPath, staffId);
+                await updateDoc(docRef, { shift: newShift });
+                // Firestore 監聽器會自動重新渲染 displayStaff
+            } catch (error) {
+                console.error("Error updating staff shift:", error);
+                alert("更新班別失敗，請稍後再試。");
+            }
+        }
+        
+        // --- 核心功能函數 ---
+
+        // *** 更新：處理人員表單提交 (加入英文名和照片上傳) ***
+        async function handleStaffFormSubmit(e) {
+            e.preventDefault();
+            if (!db) return;
+
+            const form = e.target;
+            const staffName = document.getElementById('staffName').value;
+            const staffEngName = document.getElementById('staffEngName').value;
+            const staffPhone = document.getElementById('staffPhone').value;
+            const staffShift = document.getElementById('staffShift').value;
+            
+            let staffPhotoUrl = document.getElementById('staffPhotoUrl').value;
+            const staffPhotoPreview = document.getElementById('staffPhotoPreview');
+
+            if (!staffName || !staffPhone || !staffShift) {
+                alert("請填寫姓名、電話和班別。");
+                return;
+            }
+
+            // 優先使用上傳的照片 (Base64)
+            if (staffPhotoPreview.src && staffPhotoPreview.src.startsWith('data:image/')) {
+                staffPhotoUrl = staffPhotoPreview.src;
+            } else if (!staffPhotoUrl) {
+                staffPhotoUrl = `https://placehold.co/100x100/E2E8F0/333?text=${staffName.charAt(0)}`;
+            }
+
+            const staffData = {
+                name: staffName,
+                engName: staffEngName,
+                phone: staffPhone,
+                shift: staffShift,
+                photoUrl: staffPhotoUrl
+            };
+
+            const submitBtn = form.querySelector('button[type="submit"]');
+            submitBtn.disabled = true;
+
+            try {
+                if (currentEditStaffId) {
+                    submitBtn.textContent = '更新中...';
+                    const docRef = doc(db, staffCollectionPath, currentEditStaffId);
+                    await updateDoc(docRef, staffData);
+                } else {
+                    submitBtn.textContent = '新增中...';
+                    await addDoc(collection(db, staffCollectionPath), staffData);
+                }
+                resetStaffForm();
+            } catch (error) {
+                console.error("人員資料操作失敗: ", error);
+                alert("操作失敗，請稍後再試。");
+            } finally {
+                submitBtn.disabled = false;
+            }
+        }
+
+        // *** 修復：處理編輯按鈕點擊 (班別不預選) ***
+        function handleEditStaffClick(button) {
+            const staffId = button.dataset.id;
+            const staff = allStaff.find(s => s.id === staffId);
+            if (!staff) return;
+
+            currentEditStaffId = staffId;
+
+            document.getElementById('staffFormTitle').textContent = '編輯人員';
+            document.getElementById('staffName').value = staff.name;
+            document.getElementById('staffEngName').value = staff.engName || '';
+            document.getElementById('staffPhone').value = staff.phone;
+            
+            // *** 修復點：班別不預選，設定為預設的 value=""，強制使用者重新選擇 ***
+            document.getElementById('staffShift').value = ""; 
+            
+            const staffPhotoPreview = document.getElementById('staffPhotoPreview');
+            if (staff.photoUrl && staff.photoUrl.startsWith('data:image/')) {
+                staffPhotoPreview.src = staff.photoUrl;
+                staffPhotoPreview.classList.remove('hidden');
+                document.getElementById('staffPhotoUrl').value = '';
+            } else {
+                staffPhotoPreview.src = '';
+                staffPhotoPreview.classList.add('hidden');
+                document.getElementById('staffPhotoUrl').value = staff.photoUrl;
+            }
+            document.getElementById('staffPhotoUpload').value = '';
+            document.getElementById('photoUploadStatus').textContent = '';
+
+            document.getElementById('staffFormSubmitBtn').textContent = '更新人員';
+            document.getElementById('cancelEditBtn').classList.remove('hidden');
+        }
+
+        async function handleDeleteStaffClick(button) {
+            const staffId = button.dataset.id;
+            
+            if (confirm("確定要刪除這位人員嗎？此操作無法復原。")) {
+                try {
+                    await deleteDoc(doc(db, staffCollectionPath, staffId));
+                } catch (error) {
+                    console.error("刪除人員失敗: ", error);
+                    alert("刪除失敗，請稍後再試。");
+                }
+            }
+        }
+
+        // *** 更新：重設人員表單 (加入照片清除) ***
+        function resetStaffForm() {
+            document.getElementById('staffForm').reset();
+            currentEditStaffId = null;
+            document.getElementById('staffFormTitle').textContent = '新增人員';
+            document.getElementById('staffFormSubmitBtn').textContent = '新增人員';
+            document.getElementById('cancelEditBtn').classList.add('hidden');
+            
+            document.getElementById('staffPhotoPreview').src = '';
+            document.getElementById('staffPhotoPreview').classList.add('hidden');
+            document.getElementById('photoUploadStatus').textContent = '';
+            document.getElementById('staffPhotoUpload').value = '';
+        }
+
+        async function handleSaveClick(button) {
+            if (!db) { console.error("DB 尚未初始化"); return; }
+            
+            const docId = button.dataset.id;
+            const tr = button.closest('tr');
+            const statusSelect = tr.querySelector('.status-select');
+            const remarksInput = tr.querySelector('.remarks-input');
+            const newStatus = statusSelect.value;
+            const newRemarks = remarksInput.value;
+
+            button.textContent = '儲存中...';
+            button.disabled = true;
+
+            try {
+                const docRef = doc(db, collectionPath, docId);
+                await updateDoc(docRef, {
+                    status: newStatus,
+                    remarks: newRemarks
+                });
+                
+                button.textContent = '儲存';
+                button.disabled = false;
+                button.classList.remove('bg-blue-500');
+                button.classList.add('bg-green-500');
+                setTimeout(() => {
+                    button.classList.remove('bg-green-500');
+                    button.classList.add('bg-blue-500');
+                }, 1500);
+
+            } catch (error) {
+                console.error("更新失敗: ", error);
+                button.textContent = '失敗';
+                button.disabled = false;
+                button.classList.remove('bg-blue-500');
+                button.classList.add('bg-red-500');
+            }
+        }
+
+        // --- 1. 頁面載入時執行 ---
+        document.addEventListener('DOMContentLoaded', () => {
+            
+            onAuthStateChanged(auth, async (user) => {
+                if (user) {
+                    console.log("已登入:", user.uid);
+                    userId = user.uid;
+                    isAuthReady = true;
+                    listenForRepairs();
+                    listenForAnnouncements();
+                    seedAndListenForStaff();
+                    listenForLikes();
+                } else {
+                    console.log("尚未登入，嘗試登入...");
+                    try {
+                        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                            await signInWithCustomToken(auth, __initial_auth_token);
+                        } else {
+                            await signInAnonymously(auth);
+                        }
+                    } catch (error) {
+                        console.error("Firebase 登入失敗:", error);
+                        document.body.innerHTML = '<h1 style="color: red; text-align: center; margin-top: 50px;">無法連接到認證服務。</h1>';
+                    }
+                }
+            });
+            
+            const tabStaffButton = document.getElementById('tabStaff');
+            const panelStaff = document.getElementById('panelStaff');
+            const tabFormButton = document.getElementById('tabForm');
+            const tabStatusButton = document.getElementById('tabStatus');
+            const panelForm = document.getElementById('panelForm');
+            const panelStatus = document.getElementById('panelStatus');
+            const tabAnalysisButton = document.getElementById('tabAnalysis');
+            const panelAnalysis = document.getElementById('panelAnalysis');
+            const tabCalendarButton = document.getElementById('tabCalendar');
+            const panelCalendar = document.getElementById('panelCalendar');
+            calendarEl = document.getElementById('calendar');
+            
+            const manageStaffButton = document.getElementById('manageStaffButton');
+            const staffModal = document.getElementById('staffModal');
+            const closeModalButton = document.getElementById('closeModalButton');
+            const staffForm = document.getElementById('staffForm');
+            const staffListContainer = document.getElementById('staffListContainer');
+            const cancelEditBtn = document.getElementById('cancelEditBtn');
+            const staffPhotoUpload = document.getElementById('staffPhotoUpload');
+            const staffPhotoPreview = document.getElementById('staffPhotoPreview');
+            const photoUploadStatus = document.getElementById('photoUploadStatus');
+            
+            // --- Like Modal Handlers ---
+            const likeModal = document.getElementById('likeModal');
+            const closeLikeModalButton = document.getElementById('closeLikeModalButton');
+            const likeForm = document.getElementById('likeForm');
+
+            if (closeLikeModalButton) {
+                closeLikeModalButton.addEventListener('click', () => {
+                    likeModal.classList.add('hidden');
+                    likeForm.reset();
+                });
+            }
+            if (likeForm) {
+                likeForm.addEventListener('submit', handleLikeSubmit);
+            }
+
+
+            // --- D&D 事件監聽 (修復並啟用) ---
+            const shiftContainers = [
+                document.getElementById('staffShift1'),
+                document.getElementById('staffShift2'),
+                document.getElementById('staffShift3'),
+                document.getElementById('staffShiftHoliday')
+            ].filter(Boolean); // 確保元素存在
+
+            shiftContainers.forEach(container => {
+                container.classList.add('shift-drop-zone', 'transition-all', 'duration-200', 'p-2', '-m-2', 'rounded-xl'); // 增加 padding/margin 讓拖曳更容易
+                container.addEventListener('dragover', handleDragOver);
+                container.addEventListener('dragleave', handleDragLeave);
+                container.addEventListener('drop', handleDrop);
+            });
+            
+            // D&D: 委派 dragstart 給父元素
+            panelStaff.addEventListener('dragstart', handleDragStart);
+
+
+            // *** 處理照片上傳預覽 ***
+            if (staffPhotoUpload) {
+                staffPhotoUpload.addEventListener('change', (e) => {
+                    const file = e.target.files[0];
+                    if (!file) {
+                        staffPhotoPreview.classList.add('hidden');
+                        staffPhotoPreview.src = '';
+                        photoUploadStatus.textContent = '';
+                        return;
+                    }
+                    if (file.size > 750 * 1024) { // 750KB
+                        photoUploadStatus.textContent = '錯誤：檔案太大 (> 750KB)';
+                        staffPhotoUpload.value = '';
+                        staffPhotoPreview.classList.add('hidden');
+                        staffPhotoPreview.src = '';
+                        return;
+                    }
+                    photoUploadStatus.textContent = '';
+                    const reader = new FileReader();
+                    reader.onload = (event) => {
+                        staffPhotoPreview.src = event.target.result;
+                        staffPhotoPreview.classList.remove('hidden');
+                        document.getElementById('staffPhotoUrl').value = '';
+                    };
+                    reader.readAsDataURL(file);
+                });
+            }
+
+            const tableBodyActive = document.getElementById('repairTableBodyActive');
+            if (tableBodyActive) {
+                tableBodyActive.addEventListener('click', (e) => {
+                    if (e.target && e.target.classList.contains('save-btn')) {
+                        handleSaveClick(e.target);
+                    }
+                });
+            }
+            
+            if (panelStaff) {
+                panelStaff.addEventListener('click', (e) => {
+                    const likeButton = e.target.closest('.like-btn');
+                    if (likeButton) {
+                        handleLikeClick(likeButton);
+                    }
+                });
+            }
+
+            if (staffListContainer) {
+                staffListContainer.addEventListener('click', (e) => {
+                    const editBtn = e.target.closest('.edit-btn');
+                    const deleteBtn = e.target.closest('.delete-btn');
+                    if (editBtn) {
+                        handleEditStaffClick(editBtn);
+                    }
+                    if (deleteBtn) {
+                        handleDeleteStaffClick(deleteBtn);
+                    }
+                });
+            }
+
+            if (manageStaffButton) {
+                manageStaffButton.addEventListener('click', () => {
+                    staffModal.classList.remove('hidden');
+                });
+            }
+            if (closeModalButton) {
+                closeModalButton.addEventListener('click', () => {
+                    staffModal.classList.add('hidden');
+                    resetStaffForm();
+                });
+            }
+            if (staffForm) {
+                staffForm.addEventListener('submit', handleStaffFormSubmit);
+            }
+            if(cancelEditBtn) {
+                cancelEditBtn.addEventListener('click', resetStaffForm);
+            }
+
+            function showTab(tabName) {
+                panelStaff.classList.add('hidden');
+                panelForm.classList.add('hidden');
+                panelStatus.classList.add('hidden');
+                panelAnalysis.classList.add('hidden');
+                panelCalendar.classList.add('hidden');
+                
+                tabStaffButton.classList.remove('active');
+                tabFormButton.classList.remove('active');
+                tabStatusButton.classList.remove('active');
+                tabAnalysisButton.classList.remove('active');
+                tabCalendarButton.classList.remove('active');
+
+                if (tabName === 'staff') {
+                    panelStaff.classList.remove('hidden');
+                    tabStaffButton.classList.add('active');
+                    // *** 新增：設定日期 ***
+                    const today = new Date();
+                    const options = { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' };
+                    document.getElementById('currentDateDisplay').textContent = `今天是：${today.toLocaleDateString('zh-Hant', options)}`;
+                } else if (tabName === 'form') {
+                    panelForm.classList.remove('hidden');
+                    tabFormButton.classList.add('active');
+                } else if (tabName === 'status') {
+                    panelStatus.classList.remove('hidden');
+                    tabStatusButton.classList.add('active');
+                } else if (tabName === 'analysis') {
+                    panelAnalysis.classList.remove('hidden');
+                    tabAnalysisButton.classList.add('active');
+                    updateAnalysis();
+                } else if (tabName === 'calendar') {
+                    panelCalendar.classList.remove('hidden');
+                    tabCalendarButton.classList.add('active');
+                    
+                    if (!calendar && calendarEl) {
+                        calendar = new FullCalendar.Calendar(calendarEl, {
+                            initialView: 'dayGridMonth',
+                            locale: 'zh-tw',
+                            headerToolbar: {
+                                left: 'prev,next today',
+                                center: 'title',
+                                right: 'dayGridMonth,timeGridWeek,listWeek'
+                            },
+                            buttonText: {
+                                today: '今天', month: '月', week: '週', list: '列表'
+                            },
+                            events: [],
+                            eventDidMount: function(info) {
+                                let tooltip = info.event.title;
+                                if (info.event.extendedProps.description) {
+                                    tooltip += `\n說明：${info.event.extendedProps.description}`;
+                                }
+                                info.el.setAttribute('title', tooltip);
+                            }
+                        });
+                        calendar.render();
+                        updateCalendarEvents();
+                    }
+                }
+            }
+            
+            tabStaffButton.addEventListener('click', () => showTab('staff'));
+            tabFormButton.addEventListener('click', () => showTab('form'));
+            tabStatusButton.addEventListener('click', () => showTab('status'));
+            tabAnalysisButton.addEventListener('click', () => showTab('analysis'));
+            tabCalendarButton.addEventListener('click', () => showTab('calendar'));
+            
+            showTab('staff');
+
+            const form = document.getElementById('repairForm');
+            const statusMessage = document.getElementById('statusMessage');
+            const itemPhotoInput = document.getElementById('itemPhoto');
+            const imagePreview = document.getElementById('imagePreview');
+            
+            if (itemPhotoInput) {
+                itemPhotoInput.addEventListener('change', () => {
+                    imagePreview.innerHTML = '';
+                    const file = itemPhotoInput.files[0];
+                    if (file) {
+                        if (file.size > 750 * 1024) {
+                            alert("錯誤：檔案太大 (> 750KB)");
+                            itemPhotoInput.value = '';
+                            return;
+                        }
+                        const reader = new FileReader();
+                        reader.onload = (e) => {
+                            const img = document.createElement('img');
+                            img.src = e.target.result;
+                            img.className = 'w-32 h-32 object-cover rounded-md shadow-md';
+                            imagePreview.appendChild(img);
+                        };
+                        reader.readAsDataURL(file);
+                    }
+                });
+            }
+
+            if (form) {
+                form.addEventListener('keydown', (e) => {
+                    if (e.ctrlKey && e.key === 'Enter') {
+                        document.getElementById('submitButton').click();
+                    }
+                });
+
+                form.addEventListener('submit', async (e) => {
+                    e.preventDefault();
+                    if (!db || !isAuthReady) {
+                        statusMessage.textContent = '錯誤：尚未連接到資料庫。';
+                        statusMessage.className = 'mt-6 text-center text-lg font-medium text-red-600';
+                        return;
+                    }
+
+                    statusMessage.textContent = '正在提交您的請求...';
+                    statusMessage.className = 'mt-6 text-center text-lg font-medium text-blue-600';
+                    const submitButton = document.getElementById('submitButton');
+                    submitButton.disabled = true;
+                    submitButton.textContent = '提交中...';
+
+                    const name = document.getElementById('requesterName').value;
+                    const phone = document.getElementById('contactPhone').value;
+                    const location = document.getElementById('itemLocation').value;
+                    const description = document.getElementById('itemDescription').value;
+                    const priority = document.getElementById('itemPriority').value;
+                    const category = document.getElementById('itemCategory').value;
+                    const sendEmail = document.getElementById('sendEmail').checked;
+                    const photoFile = document.getElementById('itemPhoto').files[0];
+
+                    if (!name || !phone || !location || !description || !category) {
+                        statusMessage.textContent = '錯誤：所有標記 * 的欄位都必須填寫。';
+                        statusMessage.className = 'mt-6 text-center text-lg font-medium text-red-600';
+                        submitButton.disabled = false;
+                        submitButton.textContent = '提交請求';
+                        return;
+                    }
+                    
+                    let newCaseId = '...';
+                    try {
+                        const now = new Date();
+                        const y = now.getFullYear();
+                        const m = (now.getMonth() + 1).toString().padStart(2, '0');
+                        const d = now.getDate().toString().padStart(2, '0');
+                        const datePrefix = `${y}${m}${d}`;
+                        
+                        const todayStart = new Date(y, now.getMonth(), now.getDate());
+                        const todayEnd = new Date(y, now.getMonth(), now.getDate() + 1);
+
+                        const q = query(collection(db, collectionPath), 
+                            where("createdAt", ">=", Timestamp.fromDate(todayStart)),
+                            where("createdAt", "<", Timestamp.fromDate(todayEnd))
+                        );
+
+                        const querySnapshot = await getDocs(q);
+                        const todayCount = querySnapshot.size;
+                        
+                        const serialNumber = (todayCount + 1).toString().padStart(3, '0');
+                        newCaseId = `${datePrefix}-${serialNumber}`;
+                        
+                    } catch (error) {
+                        console.error("產生案件代號失敗: ", error);
+                        statusMessage.textContent = '錯誤：無法產生案件代號。';
+                        statusMessage.className = 'mt-6 text-center text-lg font-medium text-red-600';
+                        submitButton.disabled = false;
+                        submitButton.textContent = '提交請求';
+                        return;
+                    }
+                    
+                    // 處理照片 (Base64)
+                    let photoBase64 = null;
+                    if (photoFile) {
+                        if (photoFile.size > 750 * 1024) {
+                            statusMessage.textContent = '錯誤：照片檔案太大 (> 750KB)。';
+                            statusMessage.className = 'mt-6 text-center text-lg font-medium text-red-600';
+                            submitButton.disabled = false;
+                            submitButton.textContent = '提交請求';
+                            return;
+                        }
+                        try {
+                            photoBase64 = await new Promise((resolve, reject) => {
+                                const reader = new FileReader();
+                                reader.onload = (e) => resolve(e.target.result);
+                                reader.onerror = (e) => reject(e);
+                                reader.readAsDataURL(photoFile);
+                            });
+                        } catch (error) {
+                            console.error("讀取照片失敗: ", error);
+                        }
+                    }
+                    
+                    try {
+                        await addDoc(collection(db, collectionPath), {
+                            caseId: newCaseId,
+                            requesterName: name,
+                            contactPhone: phone,
+                            location: location,
+                            description: description,
+                            priority: priority,
+                            category: category,
+                            status: '已提交',
+                            remarks: '',
+                            createdAt: serverTimestamp(),
+                            photoURL: photoBase64 // 儲存 Base64
+                        });
+
+                        statusMessage.textContent = `提交成功！您的案件代號是 ${newCaseId}。`;
+                        statusMessage.className = 'mt-6 text-center text-lg font-medium text-green-600';
+
+                        form.reset();
+                        imagePreview.innerHTML = '';
+                        
+                        if (sendEmail) {
+                            triggerMailto({
+                                caseId: newCaseId,
+                                requesterName: name,
+                                contactPhone: phone,
+                                location: location,
+                                priority: getPriorityText(priority),
+                                category: getCategoryText(category),
+                                description: description
+                            });
+                        }
+
+                        setTimeout(() => { statusMessage.textContent = ''; }, 5000);
+
+                    } catch (error) {
+                        console.error("提交失敗: ", error);
+                        statusMessage.textContent = '提交失敗，請稍後再試。';
+                        statusMessage.className = 'mt-6 text-center text-lg font-medium text-red-600';
+                    } finally {
+                        submitButton.disabled = false;
+                        submitButton.textContent = '提交請求';
+                    }
+                });
+            }
+
+            const clearButton = document.getElementById('clearButton');
+            if (clearButton) {
+                clearButton.addEventListener('click', () => {
+                    form.reset();
+                    imagePreview.innerHTML = '';
+                    statusMessage.textContent = '';
+                });
+            }
+
+            function triggerMailto(data) {
+                const to = 'chili.huang@silksaplace-tainan.com.tw';
+                const subject = `[新維修單: ${data.caseId}] ${data.category} - ${data.location}`;
+                const bodyLines = [
+                    `這是一封自動產生的維修請求通知信。`,
+                    `-----------------------------------`,
+                    `案件代號: ${data.caseId}`,
+                    `報修人: ${data.requesterName}`,
+                    `聯絡電話: ${data.contactPhone}`,
+                    `地點/房號: ${data.location}`,
+                    `優先級: ${data.priority}`,
+                    `問題分類: ${data.category}`,
+                    `-----------------------------------`,
+                    `問題描述:`,
+                    `${data.description}`
+                ];
+                const body = bodyLines.join('\n');
+                const mailtoLink = `mailto:${to}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+                window.location.href = mailtoLink;
+            }
+            
+            const announcementForm = document.getElementById('announcementForm');
+            const announcementStatus = document.getElementById('announcementStatus');
+            
+            if (announcementForm) {
+                announcementForm.addEventListener('submit', async (e) => {
+                    e.preventDefault();
+                    if (!db || !isAuthReady) {
+                        announcementStatus.textContent = '錯誤：尚未連接到資料庫。';
+                        announcementStatus.className = 'text-center text-red-600';
+                        return;
+                    }
+
+                    const title = document.getElementById('announcementTitle').value;
+                    const startDateStr = document.getElementById('announcementStartDate').value;
+                    const endDateStr = document.getElementById('announcementEndDate').value;
+                    const description = document.getElementById('announcementDescription').value;
+
+                    if (!title || !startDateStr) {
+                        announcementStatus.textContent = '請填寫標題和開始日期。';
+                        announcementStatus.className = 'text-center text-red-600';
+                        return;
+                    }
+                    
+                    const startDate = Timestamp.fromDate(new Date(startDateStr));
+                    let endDate = null;
+                    if (endDateStr) endDate = Timestamp.fromDate(new Date(endDateStr));
+                    
+                    if (endDate && endDate.toDate() < startDate.toDate()) {
+                        announcementStatus.textContent = '結束日期不能早於開始日期。';
+                        announcementStatus.className = 'text-center text-red-600';
+                        return;
+                    }
+
+                    try {
+                        announcementStatus.textContent = '正在建立公告...';
+                        announcementStatus.className = 'text-center text-blue-600';
+                        
+                        await addDoc(collection(db, announcementsCollectionPath), {
+                            title: title,
+                            startDate: startDate,
+                            endDate: endDate,
+                            description: description,
+                            createdAt: serverTimestamp()
+                        });
+                        
+                        announcementStatus.textContent = '公告建立成功！';
+                        announcementStatus.className = 'text-center text-green-600';
+                        announcementForm.reset();
+                        
+                        setTimeout(() => { announcementStatus.textContent = ''; }, 3000);
+
+                    } catch (error) {
+                        console.error("建立公告失敗: ", error);
+                        announcementStatus.textContent = '建立失敗，請稍後再試。';
+                        announcementStatus.className = 'text-center text-red-600';
+                    }
+                });
+            }
+
+        });
+    </script>
+    <!-- 載入 Firebase (結束) -->
+</head>
+<body class="bg-gray-100 min-h-screen p-4 sm:p-8">
+
+    <div class="bg-white w-full max-w-7xl mx-auto p-6 sm:p-8 rounded-xl shadow-lg"> 
+        
+        <div class="flex items-center justify-center mb-8 flex-wrap">
+            <button id="tabStaff" class="tab-button active m-1">
+                值班人員查詢
+            </button>
+            <span class="text-2xl font-light text-gray-400 mx-4 hidden sm:inline">/</span>
+            <button id="tabForm" class="tab-button m-1">
+                維修請求單
+            </button>
+            <span class="text-2xl font-light text-gray-400 mx-4 hidden sm:inline">/</span>
+            <button id="tabStatus" class="tab-button m-1">
+                維修進度追蹤
+            </button>
+            <span class="text-2xl font-light text-gray-400 mx-4 hidden sm:inline">/</span>
+            <button id="tabAnalysis" class="tab-button m-1">
+                統計與分析
+            </button>
+            <span class="text-2xl font-light text-gray-400 mx-4 hidden sm:inline">/</span>
+            <button id="tabCalendar" class="tab-button m-1">
+                報修行事曆
+            </button>
+        </div>
+        
+        <!-- *** 分頁 1: 值班人員查詢 (*** 更新：grid-cols ***) -->
+        <div id="panelStaff">
+            <div class="flex justify-between items-center mb-4">
+                <h1 class="text-3xl font-bold text-gray-800">
+                    值班人員服務查詢
+                </h1>
+                <button id="manageStaffButton" class="px-4 py-2 bg-gray-700 text-white rounded-lg hover:bg-gray-800 transition duration-300">
+                    管理人員
+                </button>
+            </div>
+
+            <!-- *** 新增：顯示日期 *** -->
+            <div id="currentDateDisplay" class="text-xl text-center text-gray-700 font-semibold mb-8">
+                <!-- 日期將載入於此 -->
+            </div>
+            
+            <p class="text-center text-gray-600 mb-8">您可以對值班人員的服務給予肯定。</p>
+            
+            <div class="space-y-8">
+                <div>
+                    <h2 class="text-2xl font-semibold text-gray-800 mb-4 pb-2 border-b border-gray-300">
+                        早班 (07:00 - 15:00)
+                    </h2>
+                    <div id="staffShift1" class="shift-drop-zone grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+                        <!-- 人員卡片將載入於此 -->
+                    </div>
+                </div>
+                
+                <div>
+                    <h2 class="text-2xl font-semibold text-gray-800 mb-4 pb-2 border-b border-gray-300">
+                        晚班 (15:00 - 24:00)
+                    </h2>
+                    <div id="staffShift2" class="shift-drop-zone grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+                        <!-- 人員卡片將載入於此 -->
+                    </div>
+                </div>
+                
+                <div>
+                    <h2 class="text-2xl font-semibold text-gray-800 mb-4 pb-2 border-b border-gray-300">
+                        大夜班 (00:00 - 08:00)
+                    </h2>
+                    <div id="staffShift3" class="shift-drop-zone grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+                        <!-- 人員卡片將載入於此 -->
+                    </div>
+                </div>
+
+                <!-- *** 新增：休假區塊 *** -->
+                <div class="mt-8">
+                    <h2 class="text-2xl font-semibold text-gray-800 mb-4 pb-2 border-b border-gray-300">
+                        休假人員
+                    </h2>
+                    <div id="staffShiftHoliday" class="shift-drop-zone grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+                        <!-- 休假人員卡片將載入於此 -->
+                    </div>
+                </div>
+            </div>
+        </div>
+        <!-- *** 分頁 1 結束 *** -->
+
+
+        <!-- *** 分頁 2: 請求表單 *** -->
+        <div id="panelForm" class="hidden">
+            <h1 class="text-3xl font-bold text-center text-gray-800 mb-8">
+                維修請求單
+            </h1>
+
+            <form id="repairForm" class="max-w-2xl mx-auto space-y-6">
+                
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-6">
+                    <div>
+                        <label for="requesterName" class="block text-sm font-medium text-gray-700">報修人姓名 *</label>
+                        <input type="text" id="requesterName" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500" required>
+                    </div>
+                    <div>
+                        <label for="contactPhone" class="block text-sm font-medium text-gray-700">聯絡電話 *</label>
+                        <input type="tel" id="contactPhone" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500" required>
+                    </div>
+                </div>
+
+                <div>
+                    <label for="itemLocation" class="block text-sm font-medium text-gray-700">地點 / 房號 *</label>
+                    <input type="text" id="itemLocation" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500" required placeholder="例如：801房 / 1F大廳">
+                </div>
+
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-6">
+                    <div>
+                        <label for="itemCategory" class="block text-sm font-medium text-gray-700">問題分類 *</label>
+                        <select id="itemCategory" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500" required>
+                            <option value="" disabled selected>請選擇分類...</option>
+                            <option value="water">水電</option>
+                            <option value="electric">電器</option>
+                            <option value="network">網路</option>
+                            <option value="woodwork">木工</option>
+                            <option value="discussion">檢修討論</option>
+                            <option value="other">其他</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label for="itemPriority" class="block text-sm font-medium text-gray-700">優先級 *</label>
+                        <select id="itemPriority" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500" required>
+                            <option value="low">低 (不影響使用)</option>
+                            <option value="medium" selected>中 (部分影響)</option>
+                            <option value="high">高 (緊急 / 無法使用)</option>
+                        </select>
+                    </div>
+                </div>
+
+                <!-- *** 修復：移除錯誤的 </small> 標籤 *** -->
+                <div>
+                    <label for="itemDescription" class="block text-sm font-medium text-gray-700">問題描述 *</label>
+                    <textarea id="itemDescription" rows="4" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500" placeholder="請詳細說明問題..." required></textarea>
+                </div>
+                
+                <!-- *** 更新：報修單也支援照片上傳 (Base64) *** -->
+                <div>
+                    <label for="itemPhoto" class="block text-sm font-medium text-gray-700">上傳照片 (選填, < 750KB)</label>
+                    <input type="file" id="itemPhoto" accept="image/*" class="mt-1 block w-full text-sm text-gray-500
+                        file:mr-4 file:py-2 file:px-4
+                        file:rounded-full file:border-0
+                        file:text-sm file:font-semibold
+                        file:bg-blue-50 file:text-blue-700
+                        hover:file:bg-blue-100
+                    ">
+                    <div id="imagePreview" class="mt-4">
+                        <!-- 預覽圖片會顯示在這裡 -->
+                    </div>
+                </div>
+
+                <div class="flex items-center">
+                    <input id="sendEmail" name="sendEmail" type="checkbox" class="h-4 w-4 text-blue-600 border-gray-300 rounded focus:ring-blue-500">
+                    <label for="sendEmail" class="ml-2 block text-sm text-gray-900">
+                        提交後，同時開啟 Email 軟體寄送通知信
+                    </label>
+                </div>
+
+                <div class="flex flex-col sm:flex-row gap-4 pt-4">
+                    <button id="submitButton" type="submit" class="w-full sm:flex-1 px-6 py-3 bg-blue-600 text-white font-semibold rounded-lg hover:bg-blue-700 transition duration-300 shadow-md">
+                        提交請求 (Ctrl+Enter)
+                    </button>
+                    <button id="clearButton" type="button" class="w-full sm:w-auto px-6 py-3 bg-gray-200 text-gray-700 font-semibold rounded-lg hover:bg-gray-300 transition duration-300">
+                        清除表單
+                    </button>
+                </div>
+
+                <div id="statusMessage" class="text-center text-lg font-medium h-6">
+                </div>
+            </form>
+        </div>
+        <!-- *** 分頁 2 結束 *** -->
+        
+        <!-- *** 分頁 3: 進度追蹤 *** -->
+        <div id="panelStatus" class="hidden">
+            <h1 class="text-3xl font-bold text-center text-gray-800 mb-8">
+                維修進度追蹤
+            </h1>
+            
+            <h2 class="text-2xl font-semibold text-gray-800 mb-4">處理中案件</h2>
+            <div class="overflow-x-auto shadow-md rounded-lg border border-gray-200 mb-8">
+                <table class="w-full min-w-[1000px] text-left">
+                    <thead class="bg-gray-100 text-xs text-gray-700 uppercase tracking-wider">
+                        <tr>
+                            <th class="px-4 py-3">案件代號</th>
+                            <th class="px-4 py-3">報修日期</th>
+                            <th class="px-4 py-3">報修人</th>
+                            <th class="px-4 py-3">地點</th>
+                            <th class="px-4 py-3">分類</th>
+                            <th class="px-4 py-3 w-40">狀態</th>
+                            <th class="px-4 py-3 w-48">維修備註</th>
+                            <th class="px-4 py-3 text-center w-24">操作</th>
+                        </tr>
+                    </thead>
+                    <tbody id="repairTableBodyActive" class="bg-white divide-y divide-gray-200">
+                        <tr><td colspan="8" class="text-center py-10 text-gray-500">正在載入資料...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <h2 class="text-2xl font-semibold text-gray-800 mb-4">已結案 / 已取消專區</h2>
+            <div class="overflow-x-auto shadow-md rounded-lg border border-gray-200">
+                <table class="w-full min-w-[1000px] text-left">
+                    <thead class="bg-gray-50 text-xs text-gray-700 uppercase tracking-wider">
+                        <tr>
+                            <th class="px-4 py-3">案件代號</th>
+                            <th class="px-4 py-3">報修日期</th>
+                            <th class="px-4 py-3">報修人</th>
+                            <th class="px-4 py-3">地點</th>
+                            <th class="px-4 py-3">分類</th>
+                            <th class="px-4 py-3 w-40">狀態</th>
+                            <th class="px-4 py-3 w-48">維修備註</th>
+                            <th class="px-4 py-3 text-center w-24">操作</th>
+                        </tr>
+                    </thead>
+                    <tbody id="repairTableBodyArchived" class="bg-white divide-y divide-gray-200">
+                        <tr><td colspan="8" class="text-center py-10 text-gray-500">正在載入資料...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+
+        </div>
+        <!-- *** 分頁 3 結束 *** -->
+
+        <!-- *** 分頁 4: 統計與分析 *** -->
+        <div id="panelAnalysis" class="hidden">
+            <h1 class="text-3xl font-bold text-center text-gray-800 mb-8">
+                統計與分析
+            </h1>
+            
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-8">
+                <div class="bg-green-50 p-6 rounded-lg shadow-md border border-green-200">
+                    <h2 class="text-lg font-semibold text-green-800">本日按讚總數</h2>
+                    <p id="statsLikesToday" class="text-5xl font-bold text-green-600 mt-2">0</p>
+                </div>
+                <div class="bg-green-50 p-6 rounded-lg shadow-md border border-green-200">
+                    <h2 class="text-lg font-semibold text-green-800">本月按讚總數</h2>
+                    <p id="statsLikesMonth" class="text-5xl font-bold text-green-600 mt-2">0</p>
+                </div>
+                
+                <div class="bg-blue-50 p-6 rounded-lg shadow-md border border-blue-200">
+                    <h2 class="text-lg font-semibold text-blue-800">總結案數 (維修)</h2>
+                    <p id="statsTotalClosed" class="text-5xl font-bold text-blue-600 mt-2">0</p>
+                </div>
+                <div class="bg-red-50 p-6 rounded-lg shadow-md border border-red-200">
+                    <h2 class="text-lg font-semibold text-red-800">高優先級結案數 (維修)</h2>
+                    <p id="statsPriorityHigh" class="text-5xl font-bold text-red-600 mt-2">0</p>
+                </div>
+            </div>
+            
+            <div class="bg-white p-6 rounded-lg shadow-md border border-gray-200">
+                <h2 class="text-xl font-semibold text-gray-800 mb-4">維修結案分類統計</h2>
+                <div class="max-w-md mx-auto">
+                    <ul id="statsCategoryList">
+                        <!-- 統計列表會動態載入這裡 -->
+                    </ul>
+                </div>
+            </div>
+        </div>
+        <!-- *** 分頁 4 結束 *** -->
+
+        <!-- *** 分頁 5: 報修行事曆 *** -->
+        <div id="panelCalendar" class="hidden">
+            <h1 class="text-3xl font-bold text-center text-gray-800 mb-8">
+                報修行事曆
+            </h1>
+            <p class="text-gray-600 text-center mb-6">
+                <span class="inline-block w-4 h-4 rounded-full bg-blue-500 mr-1 align-middle"></span> 報修單
+                <span class="inline-block w-4 h-4 rounded-full bg-green-500 mr-1 ml-4 align-middle"></span> 維護公告
+            </p>
+            
+            <div id="calendar" class="p-4 bg-white rounded-lg border border-gray-200 shadow-sm mb-8">
+            </div>
+            
+            <div class="mt-10 pt-8 border-t border-gray-200">
+                <h2 class="text-2xl font-semibold text-center text-gray-800 mb-6">
+                    建立行程公告 (維護單位用)
+                </h2>
+                <form id="announcementForm" class="max-w-2xl mx-auto space-y-4">
+                    <div>
+                        <label for="announcementTitle" class="block text-sm font-medium text-gray-700">公告標題 *</label>
+                        <input type="text" id="announcementTitle" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500" required>
+                    </div>
+                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                        <div>
+                            <label for="announcementStartDate" class="block text-sm font-medium text-gray-700">開始日期 *</label>
+                            <input type="date" id="announcementStartDate" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500" required>
+                        </div>
+                        <div>
+                            <label for="announcementEndDate" class="block text-sm font-medium text-gray-700">結束日期 (選填)</label>
+                            <input type="date" id="announcementEndDate" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500">
+                        </div>
+                    </div>
+                    <div>
+                        <label for="announcementDescription" class="block text-sm font-medium text-gray-700">說明 (選填)</label>
+                        <textarea id="announcementDescription" rows="2" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500" placeholder="例如：全區網路維護..."></textarea>
+                    </div>
+                    <div class="text-center pt-2">
+                        <button type="submit" class="w-full sm:w-auto px-6 py-3 bg-green-600 text-white font-semibold rounded-lg hover:bg-green-700 transition duration-300 shadow-md">
+                            建立公告
+                        </button>
+                    </div>
+                    <div id="announcementStatus" class="text-center text-lg font-medium h-6"></div>
+                </form>
+            </div>
+        </div>
+        <!-- *** 分頁 5 結束 *** -->
+
+
+    </div>
+
+    <!-- *** 新增：人員管理彈窗 (Modal) (*** 已更新 ***) -->
+    <div id="staffModal" class="modal hidden">
+        <div id="staffModalContent" class="modal-content">
+            <div class="flex justify-between items-center mb-6">
+                <h2 id="staffFormTitle" class="text-2xl font-semibold text-gray-800">新增人員</h2>
+                <button id="closeModalButton" class="text-gray-400 hover:text-gray-600">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                </button>
+            </div>
+
+            <!-- *** 更新：新增/編輯表單 (加入英文名和上傳) *** -->
+            <form id="staffForm" class="space-y-4 mb-8 pb-8 border-b border-gray-200">
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div>
+                        <label for="staffName" class="block text-sm font-medium text-gray-700">姓名 *</label>
+                        <input type="text" id="staffName" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500" required>
+                    </div>
+                    <div>
+                        <label for="staffEngName" class="block text-sm font-medium text-gray-700">英文名 (選填)</label>
+                        <input type="text" id="staffEngName" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500">
+                    </div>
+                </div>
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div>
+                        <label for="staffPhone" class="block text-sm font-medium text-gray-700">聯絡電話 *</label>
+                        <input type="tel" id="staffPhone" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500" required>
+                    </div>
+                    <div>
+                        <label for="staffShift" class="block text-sm font-medium text-gray-700">班別 *</label>
+                        <select id="staffShift" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500" required>
+                            <option value="" disabled selected>請選擇班別</option>
+                            <option value="07:00-15:00">早班 (07:00-15:00)</option>
+                            <option value="15:00-24:00">晚班 (15:00-24:00)</option>
+                            <option value="00:00-08:00">大夜班 (00:00-08:00)</option>
+                            <option value="holiday">休假</option>
+                        </select>
+                    </div>
+                </div>
+                <div>
+                    <label for="staffPhotoUrl" class="block text-sm font-medium text-gray-700">照片網址 (選填)</label>
+                    <div class="flex items-center space-x-2">
+                        <input type="url" id="staffPhotoUrl" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500" placeholder="https_//...">
+                        <a href="https://www.google.com/search?tbm=isch&q=person+icon" target="_blank" class="mt-1 px-3 py-2 bg-gray-200 text-gray-700 rounded-md text-sm hover:bg-gray-300 whitespace-nowrap">
+                            Google 搜尋
+                        </a>
+                    </div>
+                </div>
+                <!-- *** 修復：class_id -> class *** -->
+                <div class="relative">
+                    <label for="staffPhotoUpload" class="block text-sm font-medium text-gray-700">或 上傳照片 (選填, < 750KB)</label>
+                    <input type="file" id="staffPhotoUpload" accept="image/*" class="mt-1 block w-full text-sm text-gray-500
+                        file:mr-4 file:py-2 file:px-4
+                        file:rounded-full file:border-0
+                        file:text-sm file:font-semibold
+                        file:bg-blue-50 file:text-blue-700
+                        hover:file:bg-blue-100
+                    ">
+                    <div id="photoUploadStatus" class="text-sm text-red-600 mt-1"></div>
+                    <img id="staffPhotoPreview" src="" class="hidden w-24 h-24 rounded-full object-cover mt-2">
+                </div>
+                <div class="flex items-center justify-end space-x-3 pt-2">
+                    <button id="cancelEditBtn" type="button" class="px-4 py-2 bg-gray-200 text-gray-700 rounded-md hover:bg-gray-300 hidden">
+                        取消編輯
+                    </button>
+                    <button id="staffFormSubmitBtn" type="submit" class="px-4 py-2 bg-blue-600 text-white font-semibold rounded-md hover:bg-blue-700">
+                        新增人員
+                    </button>
+                </div>
+            </form>
+
+            <h3 class="text-xl font-semibold text-gray-800 mb-4">現有人員列表</h3>
+            <ul id="staffListContainer" class="space-y-2">
+                <!-- 人員列表將動態載入於此 -->
+            </ul>
+        </div>
+    </div>
+
+    <!-- *** 新增：按讚資訊收集彈窗 (Like Modal) *** -->
+    <div id="likeModal" class="modal hidden">
+        <div id="likeModalContent" class="bg-white rounded-lg shadow-xl w-full max-w-sm p-6">
+            <div class="flex justify-between items-center mb-6">
+                <h2 class="text-2xl font-semibold text-gray-800">給予肯定</h2>
+                <button id="closeLikeModalButton" class="text-gray-400 hover:text-gray-600">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                </button>
+            </div>
+
+            <form id="likeForm" class="space-y-4">
+                <input type="hidden" id="likeStaffId">
+                <input type="hidden" id="likeStaffName">
+
+                <div>
+                    <label for="likeUserEmail" class="block text-sm font-medium text-gray-700">您的 Email *</label>
+                    <input type="email" id="likeUserEmail" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500" placeholder="例如: user@example.com" required>
+                </div>
+                
+                <div>
+                    <label for="likeReason" class="block text-sm font-medium text-gray-700">給讚原因 *</label>
+                    <textarea id="likeReason" rows="3" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500" placeholder="例如：處理速度快、態度親切、專業能力強" required></textarea>
+                </div>
+
+                <p id="likeStatusMessage" class="text-center text-sm text-red-600 h-5"></p>
+
+                <button type="submit" id="likeSubmitButton" class="w-full px-4 py-2 bg-blue-600 text-white font-semibold rounded-md hover:bg-blue-700 transition duration-300">
+                    確認給讚
+                </button>
+            </form>
+        </div>
+    </div>
+
+</body>
+</html>
